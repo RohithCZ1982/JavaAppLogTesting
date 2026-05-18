@@ -1,0 +1,328 @@
+name: Java CI with AI Exception Summary
+
+# Triggers on every push to main branches and all pull requests
+on:
+  push:
+    branches: [main, master, develop]
+  pull_request:
+    branches: [main, master, develop]
+
+# Minimal permissions — only what's needed
+permissions:
+  contents: read        # checkout
+  pull-requests: write  # post PR comments
+  models: read          # GitHub Models API (gpt-4o-mini)
+
+jobs:
+  build-and-analyze:
+    name: Build, Test & AI Analysis
+    runs-on: ubuntu-latest
+
+    steps:
+
+      # ─── 1. CHECKOUT ──────────────────────────────────────────────────────────
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      # ─── 2. AUTO-DETECT MAVEN OR GRADLE ──────────────────────────────────────
+      - name: Detect build tool
+        id: detect
+        run: |
+          if [ -f "mvnw" ]; then
+            chmod +x mvnw
+            echo "cmd=./mvnw"  >> $GITHUB_OUTPUT
+            echo "type=maven"  >> $GITHUB_OUTPUT
+            echo "Detected: Maven Wrapper (mvnw)"
+          elif [ -f "pom.xml" ]; then
+            echo "cmd=mvn"     >> $GITHUB_OUTPUT
+            echo "type=maven"  >> $GITHUB_OUTPUT
+            echo "Detected: Maven (system)"
+          elif [ -f "gradlew" ]; then
+            chmod +x gradlew
+            echo "cmd=./gradlew" >> $GITHUB_OUTPUT
+            echo "type=gradle"   >> $GITHUB_OUTPUT
+            echo "Detected: Gradle Wrapper (gradlew)"
+          elif [ -f "build.gradle" ] || [ -f "build.gradle.kts" ]; then
+            echo "cmd=gradle"  >> $GITHUB_OUTPUT
+            echo "type=gradle" >> $GITHUB_OUTPUT
+            echo "Detected: Gradle (system)"
+          else
+            echo "::error::No build tool found. Expected pom.xml, mvnw, build.gradle, or gradlew."
+            exit 1
+          fi
+
+      # ─── 3. SETUP JDK 21 ──────────────────────────────────────────────────────
+      - name: Set up JDK 21 (Temurin)
+        uses: actions/setup-java@v4
+        with:
+          java-version: '21'
+          distribution: 'temurin'
+
+      # ─── 4. CACHE DEPENDENCIES ────────────────────────────────────────────────
+      - name: Cache Maven repository
+        if: steps.detect.outputs.type == 'maven'
+        uses: actions/cache@v4
+        with:
+          path: ~/.m2/repository
+          key: ${{ runner.os }}-maven-${{ hashFiles('**/pom.xml') }}
+          restore-keys: ${{ runner.os }}-maven-
+
+      - name: Cache Gradle caches
+        if: steps.detect.outputs.type == 'gradle'
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.gradle/caches
+            ~/.gradle/wrapper
+          key: ${{ runner.os }}-gradle-${{ hashFiles('**/*.gradle*', '**/gradle-wrapper.properties') }}
+          restore-keys: ${{ runner.os }}-gradle-
+
+      # ─── 5. BUILD AND TEST ────────────────────────────────────────────────────
+      # continue-on-error so log collection and AI summary always run,
+      # even if the build fails. We re-fail the job at the very end.
+      - name: Run build and tests
+        id: build
+        continue-on-error: true
+        shell: bash
+        run: |
+          set -o pipefail  # pipe fails if the build command fails (not just tee)
+
+          if [ "${{ steps.detect.outputs.type }}" == "maven" ]; then
+            ${{ steps.detect.outputs.cmd }} clean verify -B --no-transfer-progress 2>&1 | tee build.log
+          else
+            ${{ steps.detect.outputs.cmd }} clean build test --no-daemon --console=plain 2>&1 | tee build.log
+          fi
+
+      # ─── 6. COLLECT LOGS ──────────────────────────────────────────────────────
+      - name: Collect build and test logs
+        if: always()
+        run: |
+          mkdir -p collected-logs
+
+          # Maven Surefire / Failsafe reports
+          find . -path "*/surefire-reports/*.txt"  -exec cp {} collected-logs/ \; 2>/dev/null || true
+          find . -path "*/surefire-reports/*.xml"  -exec cp {} collected-logs/ \; 2>/dev/null || true
+          find . -path "*/failsafe-reports/*.txt"  -exec cp {} collected-logs/ \; 2>/dev/null || true
+          find . -path "*/failsafe-reports/*.xml"  -exec cp {} collected-logs/ \; 2>/dev/null || true
+
+          # Gradle test results
+          find . -path "*/build/reports/tests/**/*.xml" -exec cp {} collected-logs/ \; 2>/dev/null || true
+          find . -path "*/build/test-results/**/*.xml"  -exec cp {} collected-logs/ \; 2>/dev/null || true
+
+          # Application and generic log files
+          find . -name "*.log" \
+            -not -path "*/.git/*" \
+            -not -path "*/node_modules/*" \
+            -not -path "*/collected-logs/*" \
+            -exec cp {} collected-logs/ \; 2>/dev/null || true
+
+          # Always include the main build output
+          cp build.log collected-logs/ 2>/dev/null || true
+
+          # Merge everything into one file; keep the last 8 KB to stay inside
+          # the model's context window without wasting tokens on old output.
+          cat collected-logs/* 2>/dev/null | tail -c 8000 > truncated-logs.txt || touch truncated-logs.txt
+
+          echo "Collected $(ls collected-logs | wc -l) log file(s)."
+          echo "Truncated log size: $(wc -c < truncated-logs.txt) bytes."
+
+      # ─── 7. UPLOAD ARTIFACTS ──────────────────────────────────────────────────
+      - name: Upload logs as artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-and-test-logs
+          path: collected-logs/
+          retention-days: 7
+
+      # ─── 8. AI EXCEPTION SUMMARY (GitHub Models — gpt-4o-mini) ───────────────
+      - name: Generate AI exception summary
+        id: ai_summary
+        if: always()
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          BUILD_OUTCOME: ${{ steps.build.outcome }}
+          BUILD_TOOL: ${{ steps.detect.outputs.type }}
+          ACTOR: ${{ github.actor }}
+          SHA: ${{ github.sha }}
+          EVENT_NAME: ${{ github.event_name }}
+        run: |
+          python3 << 'PYTHON_EOF'
+          import json, os, urllib.request, urllib.error
+
+          # ── Read captured logs ────────────────────────────────────────────────
+          try:
+              with open("truncated-logs.txt") as f:
+                  logs = f.read().strip()
+          except FileNotFoundError:
+              logs = ""
+
+          if not logs:
+              logs = "No log output was captured for this run."
+
+          build_outcome = os.environ.get("BUILD_OUTCOME", "unknown")
+          build_tool    = os.environ.get("BUILD_TOOL",    "unknown")
+          actor         = os.environ.get("ACTOR",         "unknown")
+          sha           = os.environ.get("SHA",           "unknown")[:8]
+          event         = os.environ.get("EVENT_NAME",    "unknown")
+
+          # ── Prompt ───────────────────────────────────────────────────────────
+          prompt = f"""You are a senior Java/DevOps engineer reviewing a CI pipeline result.
+
+Context:
+- Build tool    : {build_tool}
+- Build outcome : {build_outcome}
+- Triggered by  : {actor} via {event} (commit {sha})
+
+Build + test log output (may be truncated to last 8 KB):
+---
+{logs}
+---
+
+Produce a concise Markdown CI report using exactly these sections:
+
+## 🔍 Build Summary
+(1–2 sentences: what happened overall)
+
+## ❌ Failures & Exceptions
+(Bullet list of each unique exception/error class with root cause and the failing test or class name.
+ Omit this section entirely if there are no failures.)
+
+## 🧪 Test Results
+(Pass / fail / skipped counts if shown in the logs. Write "Not available in logs" if absent.)
+
+## 🛠️ Recommended Fixes
+(One concrete, actionable fix per failure — file names and method names where possible.
+ Omit this section entirely if the build passed.)
+
+## ✅ Status
+End with exactly one of:
+- 🟢 **BUILD PASSED** — all checks green
+- 🔴 **BUILD FAILED** — action required before merge
+- 🟡 **BUILD UNSTABLE** — compiled but test failures present
+
+Rules: be direct and concise. No filler. No raw log dumps. Focus on what the developer must do right now.
+"""
+
+          # ── Call GitHub Models API ────────────────────────────────────────────
+          payload = {
+              "model": "gpt-4o-mini",
+              "messages": [{"role": "user", "content": prompt}],
+              "max_tokens": 900,
+              "temperature": 0.2
+          }
+
+          token = os.environ.get("GITHUB_TOKEN", "")
+          req = urllib.request.Request(
+              "https://models.inference.ai.azure.com/chat/completions",
+              data=json.dumps(payload).encode(),
+              headers={
+                  "Authorization": f"Bearer {token}",
+                  "Content-Type": "application/json"
+              }
+          )
+
+          try:
+              with urllib.request.urlopen(req, timeout=30) as resp:
+                  data    = json.loads(resp.read())
+                  summary = data["choices"][0]["message"]["content"]
+          except urllib.error.HTTPError as e:
+              err     = e.read().decode()[:300]
+              summary = f"⚠️ **AI summary unavailable** — HTTP {e.code}\n\n```\n{err}\n```"
+          except Exception as e:
+              summary = f"⚠️ **AI summary unavailable** — `{type(e).__name__}: {e}`"
+
+          # ── Write to file (avoids env-var size limits) ────────────────────────
+          with open("ai_summary.md", "w") as f:
+              f.write(summary)
+
+          print("✅ AI summary written.")
+          print(summary[:300])
+          PYTHON_EOF
+
+      # ─── 9a. POST PR COMMENT ──────────────────────────────────────────────────
+      - name: Post AI summary as PR comment
+        if: always() && github.event_name == 'pull_request'
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PR_NUMBER:    ${{ github.event.pull_request.number }}
+          HEAD_REF:     ${{ github.head_ref }}
+          BASE_REF:     ${{ github.base_ref }}
+          ACTOR:        ${{ github.actor }}
+          HEAD_SHA:     ${{ github.event.pull_request.head.sha }}
+          RUN_URL:      ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          python3 << 'PYTHON_EOF'
+          import json, os, urllib.request, urllib.error
+
+          try:
+              with open("ai_summary.md") as f:
+                  summary = f.read()
+          except FileNotFoundError:
+              summary = "⚠️ AI summary was not generated."
+
+          pr_number = os.environ["PR_NUMBER"]
+          head_ref  = os.environ["HEAD_REF"]
+          base_ref  = os.environ["BASE_REF"]
+          actor     = os.environ["ACTOR"]
+          sha       = os.environ["HEAD_SHA"][:8]
+          run_url   = os.environ["RUN_URL"]
+          repo      = os.environ["GITHUB_REPOSITORY"]
+          token     = os.environ["GITHUB_TOKEN"]
+
+          body = (
+              "## 🤖 Java CI — AI Build Report\n\n"
+              f"> **Branch:** `{head_ref}` → `{base_ref}`"
+              f"&nbsp;|&nbsp; **Author:** {actor}"
+              f"&nbsp;|&nbsp; **Commit:** `{sha}`\n\n"
+              "---\n\n"
+              f"{summary}\n\n"
+              "---\n"
+              f"<sub>📋 [View full workflow run]({run_url})"
+              " &nbsp;|&nbsp; Powered by GitHub Models (`gpt-4o-mini`)</sub>"
+          )
+
+          payload = json.dumps({"body": body}).encode()
+          req = urllib.request.Request(
+              f"https://api.github.com/repos/{repo}/issues/{pr_number}/comments",
+              data=payload,
+              headers={
+                  "Authorization": f"Bearer {token}",
+                  "Accept": "application/vnd.github+json",
+                  "X-GitHub-Api-Version": "2022-11-28",
+                  "Content-Type": "application/json"
+              }
+          )
+
+          try:
+              with urllib.request.urlopen(req) as resp:
+                  result = json.loads(resp.read())
+                  print(f"✅ Comment posted: {result.get('html_url', '(no URL)')}")
+          except urllib.error.HTTPError as e:
+              print(f"⚠️ Failed to post comment — HTTP {e.code}: {e.read().decode()[:200]}")
+          PYTHON_EOF
+
+      # ─── 9b. WRITE TO WORKFLOW SUMMARY (push events) ─────────────────────────
+      - name: Write AI summary to workflow run summary
+        if: always() && github.event_name == 'push'
+        run: |
+          {
+            echo "## 🤖 Java CI — AI Build Report"
+            echo ""
+            echo "> **Repo:** \`${{ github.repository }}\`" \
+                 "&nbsp;|&nbsp; **Branch:** \`${{ github.ref_name }}\`" \
+                 "&nbsp;|&nbsp; **Commit:** \`$(echo '${{ github.sha }}' | cut -c1-8)\`"
+            echo ""
+            echo "---"
+            echo ""
+            cat ai_summary.md 2>/dev/null || echo "⚠️ No AI summary was generated."
+          } >> $GITHUB_STEP_SUMMARY
+
+      # ─── 10. PROPAGATE FAILURE ────────────────────────────────────────────────
+      # Re-raise the build failure so the PR check is correctly marked as failed.
+      # This runs AFTER the AI comment has been posted.
+      - name: Fail workflow if build failed
+        if: steps.build.outcome == 'failure'
+        run: |
+          echo "::error::Build or tests failed. See the AI summary comment for details."
+          exit 1
