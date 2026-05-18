@@ -1,0 +1,7 @@
+services:
+  - type: web
+    name: java-app-log-testing
+    env: docker
+    plan: free
+    healthCheckPath: /actuator/health
+    autoDeploy: true
