@@ -105,7 +105,15 @@ jobs:
             -not -path "*/collected-logs/*" \
             -exec cp {} collected-logs/ \; 2>/dev/null || true
           cp build.log collected-logs/ 2>/dev/null || true
-          cat collected-logs/* 2>/dev/null | tail -c 8000 > truncated-logs.txt || touch truncated-logs.txt
+
+          # Prefer the dedicated error log; fall back to all collected logs
+          if [ -f "logs/error.log" ] && [ -s "logs/error.log" ]; then
+            echo "Using logs/error.log as primary error source"
+            cp logs/error.log collected-logs/error.log
+            tail -c 8000 collected-logs/error.log > truncated-logs.txt
+          else
+            cat collected-logs/* 2>/dev/null | tail -c 8000 > truncated-logs.txt || touch truncated-logs.txt
+          fi
           echo "Collected $(ls collected-logs | wc -l) log file(s), $(wc -c < truncated-logs.txt) bytes."
 
       # ─── 7. UPLOAD ARTIFACTS ──────────────────────────────────────────────────
@@ -149,12 +157,20 @@ jobs:
           sha           = os.environ.get("SHA",           "unknown")[:8]
           event         = os.environ.get("EVENT_NAME",    "unknown")
 
+          error_log_path = "logs/error.log"
+          log_source = (
+              "logs/error.log (dedicated error log)"
+              if os.path.isfile(error_log_path) and os.path.getsize(error_log_path) > 0
+              else "build.log (full build output)"
+          )
+
           prompt = (
               "You are a senior Java/DevOps engineer reviewing a CI pipeline result.\n\n"
               "Context:\n"
               f"- Build tool    : {build_tool}\n"
               f"- Build outcome : {build_outcome}\n"
-              f"- Triggered by  : {actor} via {event} (commit {sha})\n\n"
+              f"- Triggered by  : {actor} via {event} (commit {sha})\n"
+              f"- Log source    : {log_source}\n\n"
               "Build + test log output (may be truncated to last 8 KB):\n"
               "---\n"
               f"{logs}\n"
