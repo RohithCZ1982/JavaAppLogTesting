@@ -83,7 +83,7 @@ jobs:
         run: |
           set -o pipefail
           if [ "${{ steps.detect.outputs.type }}" == "maven" ]; then
-            ${{ steps.detect.outputs.cmd }} clean verify -B --no-transfer-progress 2>&1 | tee build.log
+            ${{ steps.detect.outputs.cmd }} clean verify -B --no-transfer-progress -fae 2>&1 | tee build.log
           else
             ${{ steps.detect.outputs.cmd }} clean build test --no-daemon --console=plain 2>&1 | tee build.log
           fi
